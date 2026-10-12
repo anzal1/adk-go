@@ -16,6 +16,7 @@ package loopagent_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"testing"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/agent/workflowagents/loopagent"
+	"google.golang.org/adk/v2/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
@@ -489,5 +491,49 @@ func TestLoopAgentWithoutSubAgentsEnds(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Errorf("LoopAgent with no sub-agents yielded %d events, want none", len(events))
+	}
+}
+
+func TestLoopAgentStopsOnContextCancellation(t *testing.T) {
+	// An empty SequentialAgent yields no events, so nothing in the loop body
+	// returns control to the consumer. Only the context can end the run.
+	empty, err := sequentialagent.New(sequentialagent.Config{
+		AgentConfig: agent.Config{Name: "empty"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopAgent, err := loopagent.New(loopagent.Config{
+		AgentConfig: agent.Config{Name: "loop", SubAgents: []agent.Agent{empty}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := runner.New(runner.Config{AppName: "test_app", Agent: loopAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	errs := make(chan []error, 1)
+	go func() {
+		var got []error
+		for _, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+			if err != nil {
+				got = append(got, err)
+			}
+		}
+		errs <- got
+	}()
+
+	select {
+	case got := <-errs:
+		if len(got) != 1 || !errors.Is(got[0], context.DeadlineExceeded) {
+			t.Errorf("got errors %v, want exactly one context.DeadlineExceeded", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop agent did not stop after its context was canceled")
 	}
 }

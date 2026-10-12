@@ -86,6 +86,14 @@ func (a *loopAgent) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 			return
 		}
 		for {
+			// A pass can yield no events (for example when every sub-agent is
+			// empty), so the consumer never gets a chance to stop the loop.
+			// Stop on cancellation here, and report it as parallelagent does.
+			if err := ctx.Err(); err != nil {
+				yield(nil, err)
+				return
+			}
+
 			shouldExit := false
 			for _, subAgent := range ctx.Agent().SubAgents() {
 				for event, err := range subAgent.Run(ctx) {
