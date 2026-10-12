@@ -460,10 +460,21 @@ func TestLoopAgentWithoutSubAgentsEnds(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	var (
+		events   []*session.Event
+		firstErr error
+	)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+		for ev, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			events = append(events, ev)
 		}
 	}()
 
@@ -472,5 +483,11 @@ func TestLoopAgentWithoutSubAgentsEnds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		cancel()
 		t.Fatal("LoopAgent with no sub-agents and no MaxIterations did not end")
+	}
+	if firstErr != nil {
+		t.Errorf("LoopAgent with no sub-agents returned error %v, want none", firstErr)
+	}
+	if len(events) != 0 {
+		t.Errorf("LoopAgent with no sub-agents yielded %d events, want none", len(events))
 	}
 }
