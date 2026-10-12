@@ -166,6 +166,9 @@ func (s *inMemoryService) Save(ctx context.Context, req *SaveRequest) (*SaveResp
 	// Read the caller-provided clock outside the service lock. A provider may
 	// call back into the service, so invoking it while locked could deadlock.
 	createTime := platform.Now(ctx)
+	// Copy before taking the lock. The copy only reads the caller's part, and
+	// inline data can be large.
+	part := clonePart(req.Part)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,36 +178,11 @@ func (s *inMemoryService) Save(ctx context.Context, req *SaveRequest) (*SaveResp
 		nextVersion = internalVer + 1
 	}
 	s.set(appName, userID, sessionID, fileName, nextVersion, &artifactEntry{
-		part:           clonePart(req.Part),
+		part:           part,
 		createTime:     createTime,
 		customMetadata: customMetadata,
 	})
 	return &SaveResponse{Version: nextVersion}, nil
-}
-
-// clonePart returns a copy of p that shares no inline data, file data, thought
-// signature or metadata with it, so neither the saver nor a loader can rewrite
-// the stored version. Save only accepts text or inline data, so the other
-// members of genai.Part are not expected on a stored artifact. adk-python
-// deep-copies on save and on load too (in_memory_artifact_service.py).
-func clonePart(p *genai.Part) *genai.Part {
-	cp := *p
-	if p.InlineData != nil {
-		blob := *p.InlineData
-		blob.Data = slices.Clone(blob.Data)
-		cp.InlineData = &blob
-	}
-	if p.FileData != nil {
-		fd := *p.FileData
-		cp.FileData = &fd
-	}
-	if p.VideoMetadata != nil {
-		vm := *p.VideoMetadata
-		cp.VideoMetadata = &vm
-	}
-	cp.ThoughtSignature = slices.Clone(p.ThoughtSignature)
-	cp.PartMetadata = maps.Clone(p.PartMetadata)
-	return &cp
 }
 
 // Delete implements [artifact.Service]
