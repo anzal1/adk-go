@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"testing"
 	"time"
 
@@ -503,37 +504,100 @@ func TestLoopAgentStopsOnContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loopAgent, err := loopagent.New(loopagent.Config{
-		AgentConfig: agent.Config{Name: "loop", SubAgents: []agent.Agent{empty}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, err := runner.New(runner.Config{AppName: "test_app", Agent: loopAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
-	if err != nil {
-		t.Fatal(err)
+
+	tests := []struct {
+		name          string
+		maxIterations uint
+		newContext    func(t *testing.T) context.Context
+		wantErr       error
+	}{
+		{
+			name:          "deadline with unlimited iterations",
+			maxIterations: 0,
+			newContext:    withDeadline,
+			wantErr:       context.DeadlineExceeded,
+		},
+		{
+			name:          "deadline with MaxIterations set",
+			maxIterations: math.MaxUint,
+			newContext:    withDeadline,
+			wantErr:       context.DeadlineExceeded,
+		},
+		{
+			name:          "cancel with unlimited iterations",
+			maxIterations: 0,
+			newContext:    withCancelAfterDelay,
+			wantErr:       context.Canceled,
+		},
+		{
+			name:          "cancel with MaxIterations set",
+			maxIterations: math.MaxUint,
+			newContext:    withCancelAfterDelay,
+			wantErr:       context.Canceled,
+		},
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-
-	errs := make(chan []error, 1)
-	go func() {
-		var got []error
-		for _, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loopAgent, err := loopagent.New(loopagent.Config{
+				AgentConfig:   agent.Config{Name: "loop", SubAgents: []agent.Agent{empty}},
+				MaxIterations: tt.maxIterations,
+			})
 			if err != nil {
-				got = append(got, err)
+				t.Fatal(err)
 			}
-		}
-		errs <- got
-	}()
+			r, err := runner.New(runner.Config{AppName: "test_app", Agent: loopAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	select {
-	case got := <-errs:
-		if len(got) != 1 || !errors.Is(got[0], context.DeadlineExceeded) {
-			t.Errorf("got errors %v, want exactly one context.DeadlineExceeded", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("loop agent did not stop after its context was canceled")
+			ctx := tt.newContext(t)
+
+			type result struct {
+				event *session.Event
+				err   error
+			}
+			done := make(chan []result, 1)
+			go func() {
+				var got []result
+				for event, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+					got = append(got, result{event, err})
+				}
+				done <- got
+			}()
+
+			select {
+			case got := <-done:
+				if len(got) == 0 {
+					t.Fatal("got no results, want a final context error")
+				}
+				for i, res := range got[:len(got)-1] {
+					if res.err != nil {
+						t.Errorf("result %d has error %v before the end, want the context error last", i, res.err)
+					}
+				}
+				if last := got[len(got)-1]; !errors.Is(last.err, tt.wantErr) {
+					t.Errorf("last error = %v, want %v", last.err, tt.wantErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("loop agent did not stop after its context was canceled")
+			}
+		})
 	}
+}
+
+func withDeadline(t *testing.T) context.Context {
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func withCancelAfterDelay(t *testing.T) context.Context {
+	ctx, cancel := context.WithCancel(t.Context())
+	timer := time.AfterFunc(50*time.Millisecond, cancel)
+	t.Cleanup(func() {
+		timer.Stop()
+		cancel()
+	})
+	return ctx
 }

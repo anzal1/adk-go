@@ -32,8 +32,9 @@ type Config struct {
 
 	// If MaxIterations == 0, then LoopAgent runs indefinitely or until any
 	// sub-agent escalates. A sub-agent error ends the loop regardless of
-	// MaxIterations. A LoopAgent with no sub-agents returns immediately
-	// without yielding any event or error.
+	// MaxIterations. A cancelled context ends the loop with the context's
+	// error. A LoopAgent with no sub-agents returns immediately without
+	// yielding any event or error.
 	MaxIterations uint
 }
 
@@ -88,7 +89,7 @@ func (a *loopAgent) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 		for {
 			// A pass can yield no events (for example when every sub-agent is
 			// empty), so the consumer never gets a chance to stop the loop.
-			// Stop on cancellation here, and report it as parallelagent does.
+			// Stop on cancellation here and yield the context's error.
 			if err := ctx.Err(); err != nil {
 				yield(nil, err)
 				return
