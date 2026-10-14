@@ -32,7 +32,7 @@ type Config struct {
 
 	// If MaxIterations == 0, then LoopAgent runs indefinitely or until any
 	// sub-agent escalates. A sub-agent error ends the loop regardless of
-	// MaxIterations. A cancelled context ends the loop with the context's
+	// MaxIterations. A canceled context ends the loop with the context's
 	// error. A LoopAgent with no sub-agents returns immediately without
 	// yielding any event or error.
 	MaxIterations uint
