@@ -1139,7 +1139,10 @@ func (r *Runner) appendMessageToSession(ctx agent.Context, storedSession session
 			return ctx, nil, fmt.Errorf("error running on run user message callback : %w", err)
 		}
 		if modifiedMsg != nil {
-			msg = modifiedMsg
+			// A plugin can return a message with any Role. Normalize it before
+			// it becomes the invocation context's UserContent: WithDelta copies
+			// the value it points to, so a later reassignment would not reach it.
+			msg = asUserContent(modifiedMsg)
 
 			ctx = ctx.WithDelta(&agent.CommonContextDelta{
 				InvocationContextDelta: &agent.InvocationContextDelta{
@@ -1149,8 +1152,8 @@ func (r *Runner) appendMessageToSession(ctx agent.Context, storedSession session
 		}
 	}
 
-	// A plugin can return a message with any Role. Normalize it too, and work on
-	// a copy so the blob replacement below never edits the caller's Parts.
+	// Work on a copy so the blob replacement below edits neither the caller's
+	// Parts nor the UserContent the invocation context already holds.
 	msg = asUserContent(msg)
 
 	artifactsService := ctx.Artifacts()
