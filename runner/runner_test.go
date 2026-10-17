@@ -519,10 +519,14 @@ func TestRunner_InboundRoleNormalizedForContextAndPlugin(t *testing.T) {
 	if _, err := sessionService.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "u", SessionID: "s2"}); err != nil {
 		t.Fatalf("sessionService.Create() error = %v", err)
 	}
+	gotUserContent = nil
 	for _, err := range r2.Run(ctx, "u", "s2", msg, agent.RunConfig{}) {
 		if err != nil {
 			t.Fatalf("r2.Run() returned an error: %v", err)
 		}
+	}
+	if gotUserContent == nil || gotUserContent.Role != genai.RoleUser || gotUserContent.Parts[0].Text != "from plugin" {
+		t.Errorf("ctx.UserContent() with plugin = %+v, want the plugin message with Role %q", gotUserContent, genai.RoleUser)
 	}
 	got, err := sessionService.Get(ctx, &session.GetRequest{AppName: "app", UserID: "u", SessionID: "s2"})
 	if err != nil {
