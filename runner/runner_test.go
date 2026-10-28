@@ -667,6 +667,9 @@ func TestRunner_AutoCreateSession_GetError(t *testing.T) {
 		},
 	}))
 	errTransient := errors.New("connection refused")
+	// A third-party service that returns its own "not found" without wrapping
+	// session.ErrNotFound.
+	errPlainNotFound := errors.New("not found")
 
 	tests := []struct {
 		name              string
@@ -681,6 +684,13 @@ func TestRunner_AutoCreateSession_GetError(t *testing.T) {
 			getErr:            errTransient,
 			wantCreates:       0,
 			wantErr:           errTransient,
+		},
+		{
+			name:              "unwrapped_not_found_is_returned_without_create",
+			autoCreateSession: true,
+			getErr:            errPlainNotFound,
+			wantCreates:       0,
+			wantErr:           errPlainNotFound,
 		},
 		{
 			name:              "wrapped_not_found_creates_once",
