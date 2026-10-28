@@ -1152,10 +1152,6 @@ func (r *Runner) appendMessageToSession(ctx agent.Context, storedSession session
 		}
 	}
 
-	// Work on a copy so the blob replacement below edits neither the caller's
-	// Parts nor the UserContent the invocation context already holds.
-	msg = asUserContent(msg)
-
 	artifactsService := ctx.Artifacts()
 	if artifactsService != nil && saveInputBlobsAsArtifacts {
 		for i, part := range msg.Parts {
