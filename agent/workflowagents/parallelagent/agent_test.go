@@ -16,6 +16,7 @@ package parallelagent_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	rand "math/rand/v2"
@@ -653,13 +654,21 @@ func TestParallelAgent_StateSync(t *testing.T) {
 // test_run_async_short_circuits_other_agents_on_escalate_action). The Go
 // agent kept every sibling running to completion.
 func TestParallelAgent_EscalateStopsSiblings(t *testing.T) {
+	var resumed atomic.Bool
 	escalator, err := agent.New(agent.Config{
 		Name: "escalator",
 		Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
-				yield(&session.Event{
+				if !yield(&session.Event{
 					LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("escalating", genai.RoleModel)},
 					Actions:     session.EventActions{Escalate: true},
+				}, nil) {
+					return
+				}
+				// adk-python never resumes the escalating branch.
+				resumed.Store(true)
+				yield(&session.Event{
+					LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("after escalate", genai.RoleModel)},
 				}, nil)
 			}
 		},
@@ -667,18 +676,14 @@ func TestParallelAgent_EscalateStopsSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// slow never yields on its own; only a cancel ends it.
+	var cancelled atomic.Bool
 	slow, err := agent.New(agent.Config{
 		Name: "slow",
 		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
-				select {
-				case <-time.After(300 * time.Millisecond):
-				case <-ctx.Done():
-					return
-				}
-				yield(&session.Event{
-					LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("slow finished", genai.RoleModel)},
-				}, nil)
+				<-ctx.Done()
+				cancelled.Store(true)
 			}
 		},
 	})
@@ -696,18 +701,84 @@ func TestParallelAgent_EscalateStopsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The deadline only bounds a regression: without the fix, slow keeps the
+	// run open until this context ends.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	var authors []string
-	for ev, err := range r.Run(t.Context(), "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+	for ev, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		authors = append(authors, ev.Author)
 	}
-	if slices.Contains(authors, "slow") {
-		t.Errorf("events authored by %v: sibling kept running after escalate, want it stopped", authors)
+	if ctx.Err() != nil {
+		t.Fatalf("run ended only at the test deadline: sibling kept running after escalate, want it cancelled")
 	}
-	if !slices.Contains(authors, "escalator") {
-		t.Errorf("events authored by %v: missing the escalating event", authors)
+	if !cancelled.Load() {
+		t.Errorf("slow was not cancelled after escalate")
+	}
+	if resumed.Load() {
+		t.Errorf("escalating branch was resumed after its escalate event, want it stopped")
+	}
+	if want := []string{"escalator"}; !slices.Equal(authors, want) {
+		t.Errorf("events authored by %v, want %v", authors, want)
+	}
+}
+
+// When a sibling fails before a direct sub-agent escalates, the caller must
+// still get the failure. adk-python queues the failure when it happens and
+// raises it before the later escalation is handled (parallel_agent.py).
+func TestParallelAgent_SiblingErrorSurvivesEscalate(t *testing.T) {
+	boom := errors.New("boom")
+	// The escalator waits for the failure to cancel its context and then
+	// escalates anyway, so the failure always comes first. The parallel agent
+	// then picks between the cancel and the escalation at random, so repeat.
+	for i := range 50 {
+		failing, err := agent.New(agent.Config{
+			Name: "failing",
+			Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) { yield(nil, boom) }
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		escalator, err := agent.New(agent.Config{
+			Name: "escalator",
+			Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					<-ctx.Done()
+					yield(&session.Event{
+						LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("escalating", genai.RoleModel)},
+						Actions:     session.EventActions{Escalate: true},
+					}, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parallelAgent, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "par", SubAgents: []agent.Agent{failing, escalator}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := runner.New(runner.Config{AppName: "test_app", Agent: parallelAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sawErr := false
+		for _, err := range r.Run(t.Context(), "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+			if errors.Is(err, boom) {
+				sawErr = true
+			}
+		}
+		if !sawErr {
+			t.Fatalf("run %d: sibling error was not returned after an escalate", i)
+		}
 	}
 }
 
@@ -735,11 +806,18 @@ func TestParallelAgent_NestedEscalateKeepsSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// slow yields only once the caller has seen the nested escalation, so the
+	// test separates the two behaviors without depending on timing.
+	seenEscalate := make(chan struct{})
 	slow, err := agent.New(agent.Config{
 		Name: "slow",
-		Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-seenEscalate:
+				case <-ctx.Done():
+					return
+				}
 				yield(&session.Event{
 					LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("slow finished", genai.RoleModel)},
 				}, nil)
@@ -760,12 +838,22 @@ func TestParallelAgent_NestedEscalateKeepsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The deadline only bounds a regression where the nested escalation is
+	// never yielded and slow waits for it.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	var authors []string
-	for ev, err := range r.Run(t.Context(), "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+	for ev, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		authors = append(authors, ev.Author)
+		if ev.Author == "escalator" && ev.Actions.Escalate {
+			close(seenEscalate)
+		}
+	}
+	if !slices.Contains(authors, "escalator") {
+		t.Errorf("events authored by %v: the nested escalation was never yielded", authors)
 	}
 	if !slices.Contains(authors, "slow") {
 		t.Errorf("events authored by %v: sibling was stopped by a nested escalate, want it to finish", authors)

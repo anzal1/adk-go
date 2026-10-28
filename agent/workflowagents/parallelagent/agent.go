@@ -42,6 +42,10 @@ type Config struct {
 // attempts on a single task, such as:
 // - Running different algorithms simultaneously.
 // - Generating multiple responses for review by a subsequent evaluation agent.
+//
+// If a direct sub-agent yields an event with Actions.Escalate, the agent stops
+// after that event and cancels the remaining branches. Escalations from deeper
+// agents are handled by their own parent workflow and do not stop this one.
 func New(cfg Config) (agent.Agent, error) {
 	if cfg.AgentConfig.Run != nil {
 		return nil, fmt.Errorf("ParallelAgent doesn't allow custom Run implementations")
@@ -130,15 +134,26 @@ func run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 		}()
 
 		for res := range resultsChan {
-			shouldContinue := yield(res.event, res.err)
-
 			// An escalation from a direct sub-agent ends this agent, as in
 			// adk-python (_asks_this_agent_to_exit). Escalations from deeper agents
 			// are re-yielded by their own parent workflow and are not for this one.
 			// The deferred cleanup cancels the remaining branches.
-			if shouldContinue && res.event != nil && res.event.Actions.Escalate && subAgentNames[res.event.Author] {
-				break
+			if res.event != nil && res.event.Actions.Escalate && subAgentNames[res.event.Author] {
+				// A sibling that already failed must still fail the run, as in
+				// adk-python where its error is queued ahead of the escalation.
+				// errgroup cancels errGroupCtx with that error as the cause; a
+				// cancel from above also cancels subAgentsCtx and is not a failure.
+				// Read errGroupCtx first: a cancel from above reaches subAgentsCtx
+				// before it propagates down.
+				if cause := context.Cause(errGroupCtx); cause != nil && subAgentsCtx.Err() == nil {
+					yield(nil, cause)
+					return
+				}
+				yield(res.event, nil)
+				return
 			}
+
+			shouldContinue := yield(res.event, res.err)
 
 			// Signal sub-agent that event processing (including session append) is complete
 			if res.ackChan != nil {
