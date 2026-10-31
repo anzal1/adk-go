@@ -782,6 +782,132 @@ func TestParallelAgent_SiblingErrorSurvivesEscalate(t *testing.T) {
 	}
 }
 
+// A sibling's error must reach the caller even when a direct sub-agent
+// escalates while that sibling is still unwinding: errgroup only records the
+// error once the sibling's Run has returned.
+func TestParallelAgent_ErrorDuringSiblingTeardownSurvivesEscalate(t *testing.T) {
+	boom := errors.New("boom")
+	failed := make(chan struct{})
+	failing, err := agent.New(agent.Config{
+		Name: "failing",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				yield(nil, boom)
+				close(failed)
+				// Teardown that lasts until the run cancels it, like a remote
+				// agent's cleanup call.
+				<-ctx.Done()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	escalator, err := agent.New(agent.Config{
+		Name: "escalator",
+		Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				<-failed
+				yield(&session.Event{
+					LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("escalating", genai.RoleModel)},
+					Actions:     session.EventActions{Escalate: true},
+				}, nil)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallelAgent, err := parallelagent.New(parallelagent.Config{
+		AgentConfig: agent.Config{Name: "par", SubAgents: []agent.Agent{failing, escalator}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := runner.New(runner.Config{AppName: "test_app", Agent: parallelAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The deadline only bounds a regression where the run never cancels the
+	// failing sibling's teardown.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	sawErr := false
+	for ev, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+		if errors.Is(err, boom) {
+			sawErr = true
+		}
+		if ev != nil && ev.Actions.Escalate {
+			t.Errorf("escalate event yielded after a sibling error, want the error instead")
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("run ended only at the test deadline")
+	}
+	if !sawErr {
+		t.Errorf("sibling error was not returned")
+	}
+}
+
+// A caller cancel that comes after a sibling's failure must not hide that
+// failure when a direct sub-agent then escalates.
+func TestParallelAgent_CancelAfterSiblingErrorKeepsError(t *testing.T) {
+	boom := errors.New("boom")
+	// The escalator sees the failure, the caller cancels, then the escalator
+	// escalates anyway. The parallel agent then picks between the cancel and
+	// the escalation at random, so repeat.
+	for i := range 50 {
+		ctx, cancel := context.WithCancel(t.Context())
+		failing, err := agent.New(agent.Config{
+			Name: "failing",
+			Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) { yield(nil, boom) }
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		escalator, err := agent.New(agent.Config{
+			Name: "escalator",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					<-ictx.Done()
+					cancel()
+					yield(&session.Event{
+						LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("escalating", genai.RoleModel)},
+						Actions:     session.EventActions{Escalate: true},
+					}, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parallelAgent, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "par", SubAgents: []agent.Agent{failing, escalator}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := runner.New(runner.Config{AppName: "test_app", Agent: parallelAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sawErr := false
+		for _, err := range r.Run(ctx, "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+			if errors.Is(err, boom) {
+				sawErr = true
+			}
+		}
+		cancel()
+		if !sawErr {
+			t.Fatalf("run %d: sibling error was hidden by a later caller cancel", i)
+		}
+	}
+}
+
 // An escalation from a deeper agent ends that agent's own parent workflow, not
 // this one. adk-python only reacts to escalations authored by a direct
 // sub-agent (parallel_agent.py, _asks_this_agent_to_exit).
