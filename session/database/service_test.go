@@ -693,3 +693,34 @@ func TestDatabaseService_ListOrderedByLastUpdateTime(t *testing.T) {
 		t.Errorf("List() order = %v, want %v", got, want)
 	}
 }
+
+func TestDatabaseService_ListTieBreaksByUserThenID(t *testing.T) {
+	svc := emptyService(t)
+	// Without this SQLite serves the app_name filter from the composite primary
+	// key index and its sorter is stable, so ties already arrive in (user_id, id)
+	// order and a dropped tie-break would stay green.
+	if err := svc.db.Exec("CREATE INDEX IF NOT EXISTS idx_test_sessions_app_update ON sessions(app_name, update_time)").Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { svc.db.Exec("DROP INDEX IF EXISTS idx_test_sessions_app_update") })
+	ctx := context.Background()
+	same := platform.WithTimeProvider(ctx, func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) })
+	// Equal update times across two users, created so that neither creation
+	// order nor ID order alone equals the want.
+	for _, k := range [][2]string{{"u2", "a"}, {"u1", "b"}, {"u1", "a"}} {
+		if _, err := svc.Create(same, &session.CreateRequest{AppName: "app", UserID: k[0], SessionID: k[1]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp, err := svc.List(ctx, &session.ListRequest{AppName: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, s := range resp.Sessions {
+		got = append(got, s.UserID()+"/"+s.ID())
+	}
+	if want := []string{"u1/a", "u1/b", "u2/a"}; !slices.Equal(got, want) {
+		t.Errorf("List() order = %v, want %v", got, want)
+	}
+}
